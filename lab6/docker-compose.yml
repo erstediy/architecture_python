@@ -1,0 +1,123 @@
+version: '3.8'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    networks:
+      - services-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    networks:
+      - services-network
+
+  postgres-write:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: real_estate
+    volumes:
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+      - postgres_write_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - services-network
+
+  postgres-read:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: real_estate_read
+    volumes:
+      - postgres_read_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - services-network
+
+  command-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.command
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_DSN=postgresql://postgres:postgres@postgres-write:5432/real_estate
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - SECRET_KEY=changeme-32-char-secret-key-here!
+    depends_on:
+      postgres-write:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - services-network
+
+  query-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.query
+    ports:
+      - "8001:8001"
+    environment:
+      - DB_DSN=postgresql://postgres:postgres@postgres-read:5432/real_estate_read
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - COMMAND_SERVICE_URL=http://command-service:8000
+    depends_on:
+      postgres-read:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      command-service:
+        condition: service_healthy
+    networks:
+      - services-network
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.notification
+    environment:
+      - KAFKA_BOOTSTRAP=kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - services-network
+
+networks:
+  services-network:
+    driver: bridge
+
+volumes:
+  postgres_write_data:
+  postgres_read_data:
