@@ -1,0 +1,489 @@
+openapi: 3.0.3
+info:
+  title: Real Estate Management API
+  description: API системы управления недвижимостью (вариант 24)
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:8000
+    description: Auth Service
+  - url: http://localhost:8001
+    description: Property Service
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    oauth2Password:
+      type: oauth2
+      flows:
+        password:
+          tokenUrl: /api/v1/auth/token
+          scopes: {}
+
+  schemas:
+    Role:
+      type: string
+      enum: [admin, agent, buyer]
+
+    UserCreate:
+      type: object
+      required: [login, password, first_name, last_name]
+      properties:
+        login:
+          type: string
+          minLength: 3
+          maxLength: 50
+          pattern: '^[a-zA-Z0-9_]+$'
+          example: agent1
+        password:
+          type: string
+          minLength: 8
+          example: Password1
+        first_name:
+          type: string
+          maxLength: 50
+          example: Иван
+        last_name:
+          type: string
+          maxLength: 50
+          example: Петров
+        role:
+          $ref: '#/components/schemas/Role'
+
+    UserPublic:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        login:
+          type: string
+          example: agent1
+        first_name:
+          type: string
+          example: Иван
+        last_name:
+          type: string
+          example: Петров
+        role:
+          $ref: '#/components/schemas/Role'
+
+    Token:
+      type: object
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+          example: bearer
+
+    PropertyType:
+      type: string
+      enum: [apartment, house, commercial, land]
+
+    PropertyStatus:
+      type: string
+      enum: [active, sold, rented, inactive]
+
+    PropertyCreate:
+      type: object
+      required: [title, type, city, address, price, area]
+      properties:
+        title:
+          type: string
+          maxLength: 200
+          example: Уютная квартира у метро
+        type:
+          $ref: '#/components/schemas/PropertyType'
+        city:
+          type: string
+          maxLength: 100
+          example: Москва
+        address:
+          type: string
+          maxLength: 300
+          example: ул. Ленина, 10
+        price:
+          type: number
+          minimum: 0
+          exclusiveMinimum: true
+          example: 8500000
+        area:
+          type: number
+          minimum: 0
+          exclusiveMinimum: true
+          example: 54.0
+        rooms:
+          type: integer
+          minimum: 0
+          nullable: true
+          example: 2
+        description:
+          type: string
+          maxLength: 2000
+          nullable: true
+          example: Свежий ремонт, рядом метро
+
+    PropertyPublic:
+      allOf:
+        - $ref: '#/components/schemas/PropertyCreate'
+        - type: object
+          properties:
+            id:
+              type: integer
+              example: 1
+            owner_id:
+              type: integer
+              example: 1
+            status:
+              $ref: '#/components/schemas/PropertyStatus'
+            created_at:
+              type: string
+              format: date-time
+
+    PropertyStatusUpdate:
+      type: object
+      required: [status]
+      properties:
+        status:
+          $ref: '#/components/schemas/PropertyStatus'
+
+    ViewingCreate:
+      type: object
+      required: [property_id, scheduled_at]
+      properties:
+        property_id:
+          type: integer
+          example: 1
+        scheduled_at:
+          type: string
+          format: date-time
+          example: '2025-06-01T10:00:00'
+
+    ViewingPublic:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        property_id:
+          type: integer
+          example: 1
+        buyer_id:
+          type: integer
+          example: 2
+        scheduled_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    Error:
+      type: object
+      properties:
+        detail:
+          type: string
+
+paths:
+  # ── Auth Service (port 8000) ──────────────────────────────────────────────
+
+  /api/v1/users:
+    post:
+      tags: [Auth Service]
+      summary: Создание нового пользователя
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCreate'
+      responses:
+        '201':
+          description: Пользователь создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserPublic'
+        '400':
+          description: Логин уже занят
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: Ошибка валидации
+
+    get:
+      tags: [Auth Service]
+      summary: Поиск пользователя по логину или маске имени/фамилии
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: login
+          in: query
+          schema:
+            type: string
+          description: Точный логин пользователя
+        - name: name
+          in: query
+          schema:
+            type: string
+          description: Маска поиска по имени или фамилии
+      responses:
+        '200':
+          description: Список пользователей
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UserPublic'
+        '400':
+          description: Не передан ни login, ни name
+        '401':
+          description: Не авторизован
+        '404':
+          description: Пользователь не найден
+
+  /api/v1/auth/token:
+    post:
+      tags: [Auth Service]
+      summary: Получение JWT токена
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                  example: agent1
+                password:
+                  type: string
+                  example: Password1
+      responses:
+        '200':
+          description: Токен выдан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Token'
+        '401':
+          description: Неверный логин или пароль
+
+  /api/v1/users/me:
+    get:
+      tags: [Auth Service]
+      summary: Получение текущего пользователя
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Данные текущего пользователя
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserPublic'
+        '401':
+          description: Не авторизован
+
+  # ── Property Service (port 8001) ──────────────────────────────────────────
+
+  /api/v1/properties:
+    post:
+      tags: [Property Service]
+      summary: Добавление объекта недвижимости
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PropertyCreate'
+      responses:
+        '201':
+          description: Объект создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PropertyPublic'
+        '403':
+          description: Только агенты и администраторы могут добавлять объекты
+        '401':
+          description: Не авторизован
+
+    get:
+      tags: [Property Service]
+      summary: Поиск объектов по городу или цене
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: city
+          in: query
+          schema:
+            type: string
+          example: Москва
+        - name: min_price
+          in: query
+          schema:
+            type: number
+          example: 5000000
+        - name: max_price
+          in: query
+          schema:
+            type: number
+          example: 15000000
+      responses:
+        '200':
+          description: Список объектов
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PropertyPublic'
+        '400':
+          description: Не указан ни один параметр поиска
+        '401':
+          description: Не авторизован
+
+  /api/v1/properties/user/{user_id}:
+    get:
+      tags: [Property Service]
+      summary: Получение объектов пользователя
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Список объектов пользователя
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PropertyPublic'
+        '401':
+          description: Не авторизован
+
+  /api/v1/properties/{property_id}:
+    get:
+      tags: [Property Service]
+      summary: Получение объекта по ID
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: property_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Объект недвижимости
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PropertyPublic'
+        '404':
+          description: Объект не найден
+        '401':
+          description: Не авторизован
+
+  /api/v1/properties/{property_id}/status:
+    patch:
+      tags: [Property Service]
+      summary: Изменение статуса объекта
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: property_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PropertyStatusUpdate'
+      responses:
+        '200':
+          description: Статус обновлён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PropertyPublic'
+        '403':
+          description: Нет прав на изменение
+        '404':
+          description: Объект не найден
+        '401':
+          description: Не авторизован
+
+  /api/v1/viewings:
+    post:
+      tags: [Property Service]
+      summary: Запись на просмотр объекта
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ViewingCreate'
+      responses:
+        '201':
+          description: Запись создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ViewingPublic'
+        '403':
+          description: Только покупатели могут записываться на просмотр
+        '404':
+          description: Объект не найден
+        '401':
+          description: Не авторизован
+
+  /api/v1/viewings/property/{property_id}:
+    get:
+      tags: [Property Service]
+      summary: Получение записей на просмотр объекта
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: property_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Список записей на просмотр
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ViewingPublic'
+        '403':
+          description: Нет прав на просмотр
+        '404':
+          description: Объект не найден
+        '401':
+          description: Не авторизован
