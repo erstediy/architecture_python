@@ -1,0 +1,219 @@
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, Field
+from typing import Optional, List
+from datetime import datetime
+from enum import Enum
+import httpx
+import os
+import asyncpg
+
+AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8000")
+DB_DSN = os.getenv("DB_DSN", "postgresql://postgres:postgres@postgres:5432/real_estate")
+
+app = FastAPI(title="Property Service", version="1.0.0")
+security = HTTPBearer()
+
+pool: Optional[asyncpg.Pool] = None
+
+
+class PropertyStatus(str, Enum):
+    active = "active"
+    sold = "sold"
+    rented = "rented"
+    inactive = "inactive"
+
+
+class PropertyType(str, Enum):
+    apartment = "apartment"
+    house = "house"
+    commercial = "commercial"
+    land = "land"
+
+
+class PropertyCreate(BaseModel):
+    title: str = Field(..., max_length=200)
+    type: PropertyType
+    city: str = Field(..., max_length=100)
+    address: str = Field(..., max_length=300)
+    price: float = Field(..., gt=0)
+    area: float = Field(..., gt=0)
+    rooms: Optional[int] = Field(None, ge=0)
+    description: Optional[str] = Field(None, max_length=2000)
+
+
+class PropertyPublic(PropertyCreate):
+    id: int
+    owner_id: int
+    status: PropertyStatus
+    created_at: datetime
+
+
+class PropertyStatusUpdate(BaseModel):
+    status: PropertyStatus
+
+
+class ViewingCreate(BaseModel):
+    property_id: int
+    scheduled_at: datetime
+
+
+class ViewingPublic(BaseModel):
+    id: int
+    property_id: int
+    buyer_id: int
+    scheduled_at: datetime
+    created_at: datetime
+
+
+class UserPublic(BaseModel):
+    id: int
+    login: str
+    first_name: str
+    last_name: str
+    role: str
+
+
+@app.on_event("startup")
+async def startup():
+    global pool
+    pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=10)
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await pool.close()
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> UserPublic:
+    token = credentials.credentials
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{AUTH_SERVICE_URL}/api/v1/users/me",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=5,
+            )
+    except httpx.RequestError:
+        raise HTTPException(status_code=503, detail="Auth service unavailable")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    return UserPublic(**resp.json())
+
+
+def _row_to_property(row) -> PropertyPublic:
+    return PropertyPublic(
+        id=row["id"], owner_id=row["owner_id"], title=row["title"], type=row["type"],
+        city=row["city"], address=row["address"], price=float(row["price"]),
+        area=float(row["area"]), rooms=row["rooms"], description=row["description"],
+        status=row["status"], created_at=row["created_at"],
+    )
+
+
+@app.post("/api/v1/properties", response_model=PropertyPublic, status_code=201)
+async def create_property(body: PropertyCreate, user: UserPublic = Depends(get_current_user)):
+    if user.role not in ("agent", "admin"):
+        raise HTTPException(status_code=403, detail="Only agents and admins can add properties")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO properties (owner_id, title, type, city, address, price, area, rooms, description)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+               RETURNING *""",
+            user.id, body.title, body.type.value, body.city, body.address,
+            body.price, body.area, body.rooms, body.description,
+        )
+    return _row_to_property(row)
+
+
+@app.get("/api/v1/properties", response_model=List[PropertyPublic])
+async def search_properties(
+    city: Optional[str] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    user: UserPublic = Depends(get_current_user),
+):
+    if city is None and min_price is None and max_price is None:
+        raise HTTPException(status_code=400, detail="Provide 'city', 'min_price' or 'max_price'")
+
+    conditions = ["status = 'active'"]
+    params = []
+    i = 1
+    if city is not None:
+        conditions.append(f"city = ${i}"); params.append(city); i += 1
+    if min_price is not None:
+        conditions.append(f"price >= ${i}"); params.append(min_price); i += 1
+    if max_price is not None:
+        conditions.append(f"price <= ${i}"); params.append(max_price); i += 1
+
+    query = f"SELECT * FROM properties WHERE {' AND '.join(conditions)} ORDER BY created_at DESC"
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(query, *params)
+    return [_row_to_property(r) for r in rows]
+
+
+@app.get("/api/v1/properties/user/{user_id}", response_model=List[PropertyPublic])
+async def get_user_properties(user_id: int, user: UserPublic = Depends(get_current_user)):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM properties WHERE owner_id = $1 ORDER BY created_at DESC", user_id)
+    return [_row_to_property(r) for r in rows]
+
+
+@app.get("/api/v1/properties/{property_id}", response_model=PropertyPublic)
+async def get_property(property_id: int, user: UserPublic = Depends(get_current_user)):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM properties WHERE id = $1", property_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Property not found")
+    return _row_to_property(row)
+
+
+@app.patch("/api/v1/properties/{property_id}/status", response_model=PropertyPublic)
+async def update_property_status(
+    property_id: int, body: PropertyStatusUpdate, user: UserPublic = Depends(get_current_user)
+):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM properties WHERE id = $1", property_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Property not found")
+        if row["owner_id"] != user.id and user.role != "admin":
+            raise HTTPException(status_code=403, detail="Not authorized")
+        row = await conn.fetchrow(
+            "UPDATE properties SET status = $1 WHERE id = $2 RETURNING *",
+            body.status.value, property_id
+        )
+    return _row_to_property(row)
+
+
+@app.post("/api/v1/viewings", response_model=ViewingPublic, status_code=201)
+async def create_viewing(body: ViewingCreate, user: UserPublic = Depends(get_current_user)):
+    if user.role not in ("buyer", "admin"):
+        raise HTTPException(status_code=403, detail="Only buyers can schedule viewings")
+    async with pool.acquire() as conn:
+        exists = await conn.fetchrow("SELECT id FROM properties WHERE id = $1", body.property_id)
+        if not exists:
+            raise HTTPException(status_code=404, detail="Property not found")
+        row = await conn.fetchrow(
+            "INSERT INTO viewings (property_id, buyer_id, scheduled_at) VALUES ($1,$2,$3) RETURNING *",
+            body.property_id, user.id, body.scheduled_at,
+        )
+    return ViewingPublic(id=row["id"], property_id=row["property_id"], buyer_id=row["buyer_id"],
+                         scheduled_at=row["scheduled_at"], created_at=row["created_at"])
+
+
+@app.get("/api/v1/viewings/property/{property_id}", response_model=List[ViewingPublic])
+async def get_property_viewings(property_id: int, user: UserPublic = Depends(get_current_user)):
+    async with pool.acquire() as conn:
+        prop = await conn.fetchrow("SELECT owner_id FROM properties WHERE id = $1", property_id)
+        if not prop:
+            raise HTTPException(status_code=404, detail="Property not found")
+        if prop["owner_id"] != user.id and user.role != "admin":
+            raise HTTPException(status_code=403, detail="Not authorized")
+        rows = await conn.fetch(
+            "SELECT * FROM viewings WHERE property_id = $1 ORDER BY scheduled_at", property_id)
+    return [ViewingPublic(id=r["id"], property_id=r["property_id"], buyer_id=r["buyer_id"],
+                          scheduled_at=r["scheduled_at"], created_at=r["created_at"]) for r in rows]
