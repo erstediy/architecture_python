@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  mongo:
+    image: mongo:7
+    environment:
+      MONGO_INITDB_DATABASE: real_estate
+    volumes:
+      - ./db/data.js:/docker-entrypoint-initdb.d/01_data.js
+      - mongo_data:/data/db
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - services-network
+
+  auth-service:
+    build:
+      context: .
+      args:
+        SERVICE: auth_service
+        PORT: 8000
+    ports:
+      - "8000:8000"
+    environment:
+      - SECRET_KEY=changeme-32-char-secret-key-here!
+      - MONGO_URL=mongodb://mongo:27017
+      - DB_NAME=real_estate
+    depends_on:
+      mongo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - services-network
+
+  property-service:
+    build:
+      context: .
+      args:
+        SERVICE: property_service
+        PORT: 8001
+    ports:
+      - "8001:8001"
+    environment:
+      - AUTH_SERVICE_URL=http://auth-service:8000
+      - MONGO_URL=mongodb://mongo:27017
+      - DB_NAME=real_estate
+    depends_on:
+      auth-service:
+        condition: service_healthy
+    networks:
+      - services-network
+
+networks:
+  services-network:
+    driver: bridge
+
+volumes:
+  mongo_data:
